@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +32,7 @@ const (
 	openAIURL                          = "https://opencode.ai/zen/go/v1/chat/completions"
 	codexProfileName                   = "ocgo-launch"
 	maxAnthropicToolResultContentChars = 120000
+	maxRequestBodyBytes                = 100 << 20 // 100 MiB — guards against unbounded local DoS
 )
 
 var version = "dev"
@@ -659,14 +663,14 @@ func loadModelMappings() (map[string]map[string]string, error) {
 }
 
 func saveModelMappings(mappings map[string]map[string]string) error {
-	if err := os.MkdirAll(filepath.Dir(modelMappingFile()), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(modelMappingFile()), 0700); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(mappings, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(modelMappingFile(), append(b, '\n'), 0644)
+	return os.WriteFile(modelMappingFile(), append(b, '\n'), 0600)
 }
 
 func resolveMappedModel(tool, source string, mappings map[string]map[string]string) string {
@@ -737,7 +741,11 @@ func launchCmd() *cobra.Command {
 		}
 		c := exec.Command(bin, claudeArgs...)
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-		c.Env = append(os.Environ(), "ANTHROPIC_BASE_URL="+base, "ANTHROPIC_AUTH_TOKEN=unused")
+		// Security: pass the proxy auth token so Claude Code authenticates to
+		// the local proxy. The proxy injects the real OpenCode Go API key
+		// upstream; this token never leaves localhost.
+		proxyToken := readProxyToken()
+		c.Env = append(os.Environ(), "ANTHROPIC_BASE_URL="+base, "ANTHROPIC_AUTH_TOKEN="+proxyToken)
 		mappings, err := loadModelMappings()
 		if err != nil {
 			return err
@@ -816,7 +824,11 @@ func launchCmd() *cobra.Command {
 		}
 		c := exec.Command(bin, codexArgs...)
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-		c.Env = append(os.Environ(), "OPENAI_API_KEY=ocgo")
+		// Security: pass the proxy auth token as the API key so Codex
+		// authenticates to the local proxy. The proxy injects the real
+		// OpenCode Go API key upstream.
+		proxyToken := readProxyToken()
+		c.Env = append(os.Environ(), "OPENAI_API_KEY="+proxyToken)
 		if mappings, err := loadModelMappings(); err == nil {
 			printLaunchMapping("codex", mappings["codex"])
 		}
@@ -890,16 +902,22 @@ func statusCmd() *cobra.Command {
 }
 
 func runServer(cfg Config) error {
-	if err := os.MkdirAll(configDir(), 0755); err == nil {
-		_ = os.WriteFile(pidFile(), []byte(fmt.Sprint(os.Getpid())), 0644)
+	if err := os.MkdirAll(configDir(), 0700); err == nil {
+		_ = os.WriteFile(pidFile(), []byte(fmt.Sprint(os.Getpid())), 0600)
 		defer os.Remove(pidFile())
+	}
+	// Security: generate (or reuse) a local auth token so that only processes
+	// launched by ocgo (which receive the token via env var) can use the proxy.
+	token, err := ensureProxyToken()
+	if err != nil {
+		return fmt.Errorf("proxy token: %w", err)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	mux.HandleFunc("/v1/messages/count_tokens", countTokens)
-	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, cfg) })
-	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) { proxyChatCompletions(w, r, cfg) })
-	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, r *http.Request) { proxyResponses(w, r, cfg) })
+	mux.HandleFunc("/v1/messages", withProxyAuth(token, proxyMessages, cfg))
+	mux.HandleFunc("/v1/chat/completions", withProxyAuth(token, proxyChatCompletions, cfg))
+	mux.HandleFunc("/v1/responses", withProxyAuth(token, proxyResponses, cfg))
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	fmt.Printf("ocgo proxy listening on http://%s\n", addr)
 	return http.ListenAndServe(addr, mux)
@@ -965,7 +983,7 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg Config) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 	if err != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
@@ -3049,12 +3067,12 @@ func startServerProcess(detached bool) (*exec.Cmd, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(configDir(), 0755); err != nil {
+	if err := os.MkdirAll(configDir(), 0700); err != nil {
 		return nil, err
 	}
 	args := []string{"serve"}
 	cmd := exec.Command(bin, args...)
-	logf, err := os.OpenFile(filepath.Join(configDir(), "ocgo.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	logf, err := os.OpenFile(filepath.Join(configDir(), "ocgo.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -3073,6 +3091,69 @@ func startServerProcess(detached bool) (*exec.Cmd, error) {
 func configDir() string  { home, _ := os.UserHomeDir(); return filepath.Join(home, ".config", "ocgo") }
 func configFile() string { return filepath.Join(configDir(), "config.json") }
 func pidFile() string    { return filepath.Join(configDir(), "ocgo.pid") }
+
+// proxyTokenFile returns the path to the local auth token used by the proxy.
+// The file is created with 0600 permissions so only the owner can read it.
+func proxyTokenFile() string { return filepath.Join(configDir(), ".proxy-token") }
+
+// ensureProxyToken returns the existing proxy auth token, generating and
+// persisting a new random one (0600) if none exists yet.
+func ensureProxyToken() (string, error) {
+	if b, err := os.ReadFile(proxyTokenFile()); err == nil {
+		if t := strings.TrimSpace(string(b)); t != "" {
+			return t, nil
+		}
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate proxy token: %w", err)
+	}
+	token := "ocgo-" + hex.EncodeToString(raw)
+	if err := os.MkdirAll(configDir(), 0700); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(proxyTokenFile(), []byte(token), 0600); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// readProxyToken reads the current proxy auth token, returning "" if absent.
+func readProxyToken() string {
+	b, err := os.ReadFile(proxyTokenFile())
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// validProxyAuth checks the incoming Authorization / x-api-key header against
+// the expected token using a constant-time comparison.
+func validProxyAuth(r *http.Request, token string) bool {
+	if token == "" {
+		return false
+	}
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		provided := strings.TrimPrefix(auth, "Bearer ")
+		return subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
+	}
+	if key := r.Header.Get("X-Api-Key"); key != "" {
+		return subtle.ConstantTimeCompare([]byte(key), []byte(token)) == 1
+	}
+	return false
+}
+
+// withProxyAuth wraps a handler so that every request must carry the local
+// proxy token. The /health endpoint is intentionally left unauthenticated.
+func withProxyAuth(token string, h func(http.ResponseWriter, *http.Request, Config), cfg Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !validProxyAuth(r, token) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h(w, r, cfg)
+	}
+}
 
 var modelMappingFile = func() string { return filepath.Join(configDir(), "model-mapping.json") }
 
@@ -3093,7 +3174,7 @@ func codexModelCatalogFile() string {
 
 func ensureCodexConfig(base string) error {
 	path := codexConfigFile()
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
 	if err := writeCodexModelCatalog(codexModelCatalogFile()); err != nil {
@@ -3119,7 +3200,7 @@ func writeCodexProfile(path, baseURL string) error {
 		`wire_api = "responses"`,
 		"",
 	}, "\n")
-	if err := os.WriteFile(profilePath, []byte(profileText), 0644); err != nil {
+	if err := os.WriteFile(profilePath, []byte(profileText), 0600); err != nil {
 		return err
 	}
 	b, err := os.ReadFile(path)
@@ -3130,7 +3211,7 @@ func writeCodexProfile(path, baseURL string) error {
 		return err
 	}
 	cleaned := stripLegacyCodexProfile(text)
-	return os.WriteFile(path, []byte(cleaned), 0644)
+	return os.WriteFile(path, []byte(cleaned), 0600)
 }
 
 func stripLegacyCodexProfile(text string) string {
@@ -3233,7 +3314,7 @@ func writeCodexModelCatalog(path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(b, '\n'), 0644)
+	return os.WriteFile(path, append(b, '\n'), 0600)
 }
 
 func checkCodexVersion() error {
@@ -3286,7 +3367,7 @@ func versionParts(v string) [3]int {
 }
 
 func saveConfig(cfg Config) error {
-	if err := os.MkdirAll(configDir(), 0755); err != nil {
+	if err := os.MkdirAll(configDir(), 0700); err != nil {
 		return err
 	}
 	b, _ := json.MarshalIndent(cfg, "", "  ")
@@ -3312,7 +3393,23 @@ func loadConfig() (Config, error) {
 	if cfg.Port == 0 {
 		cfg.Port = defaultPort
 	}
+	// Security: force loopback-only binding. Never allow the proxy to listen
+	// on external interfaces even if config.json is tampered, because the
+	// proxy injects the real API key into every forwarded request.
+	if !isLoopbackHost(cfg.Host) {
+		cfg.Host = defaultHost
+	}
 	return cfg, nil
+}
+
+// isLoopbackHost reports whether host is a loopback address safe for the
+// unauthenticated local proxy.
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	}
+	return false
 }
 
 func readPID() (int, error) {
