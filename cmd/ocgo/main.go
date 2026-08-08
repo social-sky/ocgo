@@ -3198,6 +3198,8 @@ func writeCodexProfile(path, baseURL string) error {
 		`name = "OpenCode Go"`,
 		fmt.Sprintf("base_url = %q", baseURL),
 		`wire_api = "responses"`,
+		`env_key = "OPENAI_API_KEY"`,
+		`requires_openai_auth = false`,
 		"",
 	}, "\n")
 	if err := os.WriteFile(profilePath, []byte(profileText), 0600); err != nil {
